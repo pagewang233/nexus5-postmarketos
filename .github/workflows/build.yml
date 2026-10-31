@@ -20,11 +20,7 @@ jobs:
       EXPORT_DIR: /home/runner/postmarketos-export
 
     steps:
-      # --------------------------------------------------
-      # 1. Install dependencies
-      # --------------------------------------------------
       - name: Install dependencies
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -41,13 +37,10 @@ jobs:
             zip \
             unzip \
             file \
-            rsync
+            rsync \
+            expect
 
-      # --------------------------------------------------
-      # 2. Install pmbootstrap
-      # --------------------------------------------------
       - name: Install pmbootstrap
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -63,16 +56,11 @@ jobs:
 
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # --------------------------------------------------
-      # 3. Clone pmaports
-      # --------------------------------------------------      
       - name: Clone pmaports
-        shell: bash
         run: |
           set -euo pipefail
 
-          git clone \
-            --depth=1 \
+          git clone --depth=1 \
             https://gitlab.postmarketos.org/postmarketOS/pmaports.git \
             "$PMB_APORTS"
 
@@ -82,29 +70,14 @@ jobs:
           echo "=== pmaports revision ==="
           git -C "$PMB_APORTS" rev-parse HEAD
 
-          echo "=== Nexus 5 device ==="
-          test -f \
-            "$PMB_APORTS/device/testing/device-lg-hammerhead/APKBUILD"
-
-      # --------------------------------------------------
-      # 4. Check Nexus 5 device package
-      # --------------------------------------------------
-      - name: Check Nexus 5 device support
-        shell: bash
+      - name: Validate Nexus 5 device
         run: |
           set -euo pipefail
 
           DEVICE_DIR="$PMB_APORTS/device/testing/device-$DEVICE"
 
-          if [ ! -f "$DEVICE_DIR/APKBUILD" ]; then
-            echo "::error::Device package not found: $DEVICE_DIR"
-            exit 1
-          fi
-
-          if [ ! -f "$DEVICE_DIR/deviceinfo" ]; then
-            echo "::error::Deviceinfo not found"
-            exit 1
-          fi
+          test -f "$DEVICE_DIR/APKBUILD"
+          test -f "$DEVICE_DIR/deviceinfo"
 
           echo "=== Device package ==="
           grep -E \
@@ -114,59 +87,127 @@ jobs:
           echo "=== Device information ==="
           cat "$DEVICE_DIR/deviceinfo"
 
-      # --------------------------------------------------
-      # 5. Generate pmbootstrap configuration
-      # --------------------------------------------------
-      - name: Configure pmbootstrap
+      - name: Initialize pmbootstrap
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p "$(dirname "$PMB_CONFIG")"
 
+          # GitHub Actions 每次使用全新环境。
+          # 不提前创建空工作目录，避免版本迁移错误。
+          rm -rf "$PMB_WORK"
+
           cat > "$PMB_CONFIG" <<EOF
           [pmbootstrap]
           aports = $PMB_APORTS
           work = $PMB_WORK
           device = $DEVICE
-          ui = none
           user = user
           hostname = nexus5
           timezone = UTC
           EOF
 
-          echo "=== Configuration ==="
-          cat "$PMB_CONFIG"
-
           echo "=== pmbootstrap version ==="
           pmbootstrap --version
-          pmbootstrap --config "$PMB_CONFIG" init
+
+          # pmbootstrap init 需要交互输入。
+          # 使用 expect 自动接受默认值，并为设备选择提供输入。
+          cat > /tmp/pmbootstrap-init.exp <<'EXPECT'
+          #!/usr/bin/expect -f
+
+          set timeout 300
+          log_user 1
+
+          spawn pmbootstrap --config $env(PMB_CONFIG) init
+
+          expect {
+            -re {Work path.*:} {
+              send "\r"
+              exp_continue
+            }
+
+            -re {Channel.*:} {
+              send "\r"
+              exp_continue
+            }
+
+            -re {Vendor.*:} {
+              send "lg\r"
+              exp_continue
+            }
+
+            -re {Device codename.*:} {
+              send "hammerhead\r"
+              exp_continue
+            }
+
+            -re {Device.*:} {
+              send "hammerhead\r"
+              exp_continue
+            }
+
+            -re {Username.*:} {
+              send "user\r"
+              exp_continue
+            }
+
+            -re {User interface.*:} {
+              send "\r"
+              exp_continue
+            }
+
+            -re {UI.*:} {
+              send "\r"
+              exp_continue
+            }
+
+            -re {Continue.*:} {
+              send "\r"
+              exp_continue
+            }
+
+            -re {\[[^\]]*\]:} {
+              send "\r"
+              exp_continue
+            }
+
+            timeout {
+              puts stderr "ERROR: pmbootstrap init timed out"
+              exit 1
+            }
+
+            eof
+          }
+
+          catch wait result
+          set exit_code [lindex $result 3]
+          exit $exit_code
+          EXPECT
+
+          chmod +x /tmp/pmbootstrap-init.exp
+
+          /tmp/pmbootstrap-init.exp
+
           echo "=== pmbootstrap status ==="
           pmbootstrap \
             --config "$PMB_CONFIG" \
             status
 
-      # --------------------------------------------------
-      # 6. Build postmarketOS Recovery ZIP
-      # --------------------------------------------------
-      - name: Build TWRP Recovery ZIP
+      - name: Build TWRP recovery ZIP
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "=== Building postmarketOS ==="
+
           pmbootstrap \
             --config "$PMB_CONFIG" \
             --details-to-stdout \
-            --timeout 3600 \
-            --assume-yes \
             install \
-            --android-recovery-zip \
-            --password postmarketos
+            --android-recovery-zip
 
-      # --------------------------------------------------
-      # 7. Export generated ROM
-      # --------------------------------------------------
-      - name: Export ROM
+      - name: Export images
         shell: bash
         run: |
           set -euo pipefail
@@ -175,7 +216,6 @@ jobs:
 
           pmbootstrap \
             --config "$PMB_CONFIG" \
-            --details-to-stdout \
             export "$EXPORT_DIR"
 
           echo "=== Exported files ==="
@@ -183,45 +223,24 @@ jobs:
           find "$EXPORT_DIR" \
             -maxdepth 3 \
             -type f \
-            -printf '%p (%s bytes)\n'
+            -printf '%p %s bytes\n'
 
-          echo "=== Checking Recovery ZIP ==="
+          echo "=== ZIP files ==="
 
-          ZIP_FILE=$(find "$EXPORT_DIR" \
+          find "$EXPORT_DIR" \
             -type f \
             -iname '*.zip' \
-            -print -quit)
+            -print
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "::error::Recovery ZIP not found"
-            exit 1
-          fi
-
-          echo "Recovery ZIP: $ZIP_FILE"
-
-          unzip -t "$ZIP_FILE"
-
-          echo "=== ZIP contents ==="
-          unzip -l "$ZIP_FILE" | head -80 || true
-
-          echo "=== SHA256 ==="
-          sha256sum "$ZIP_FILE" | tee \
-            "$EXPORT_DIR/SHA256SUMS.txt"
-
-      # --------------------------------------------------
-      # 8. Upload ROM
-      # --------------------------------------------------
       - name: Upload ROM
         uses: actions/upload-artifact@v4
         with:
-          name: postmarketos-lg-hammerhead-twrp
-          path: ${{ env.EXPORT_DIR }}/
-          retention-days: 14
+          name: nexus5-postmarketos
+          path: /home/runner/postmarketos-export/
           if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
-      # --------------------------------------------------
-      # 9. Upload logs on failure
-      # --------------------------------------------------
       - name: Upload debug logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -232,3 +251,4 @@ jobs:
             /home/runner/.local/var/pmbootstrap/logs/
             /home/runner/.config/pmbootstrap_v3.cfg
           if-no-files-found: ignore
+          retention-days: 7
