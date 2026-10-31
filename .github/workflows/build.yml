@@ -20,6 +20,9 @@ jobs:
       EXPORT_DIR: /home/runner/postmarketos-export
 
     steps:
+      # --------------------------------------------------
+      # 1. Install dependencies
+      # --------------------------------------------------
       - name: Install dependencies
         shell: bash
         run: |
@@ -40,6 +43,9 @@ jobs:
             file \
             rsync
 
+      # --------------------------------------------------
+      # 2. Install pmbootstrap
+      # --------------------------------------------------
       - name: Install pmbootstrap
         shell: bash
         run: |
@@ -59,6 +65,9 @@ jobs:
 
           "$HOME/.local/bin/pmbootstrap" --version
 
+      # --------------------------------------------------
+      # 3. Clone pmaports
+      # --------------------------------------------------
       - name: Clone pmaports
         shell: bash
         run: |
@@ -74,6 +83,9 @@ jobs:
           echo "=== pmaports revision ==="
           git -C "$PMB_APORTS" rev-parse HEAD
 
+      # --------------------------------------------------
+      # 4. Check device support
+      # --------------------------------------------------
       - name: Check Nexus 5 device support
         shell: bash
         run: |
@@ -94,6 +106,9 @@ jobs:
 
           cat "$DEVICE_DIR/deviceinfo"
 
+      # --------------------------------------------------
+      # 5. Initialize pmbootstrap
+      # --------------------------------------------------
       - name: Initialize pmbootstrap
         shell: bash
         run: |
@@ -101,26 +116,95 @@ jobs:
 
           mkdir -p "$(dirname "$PMB_CONFIG")"
 
-          echo "=== pmbootstrap init help ==="
-          pmbootstrap init --help
+          # A fresh runner should not have an existing work dir.
+          # Do not manually create this directory.
+          if [ -e "$PMB_WORK" ]; then
+            echo "Removing stale pmbootstrap work directory"
+            sudo rm -rf "$PMB_WORK"
+          fi
 
-          echo "=== Initialize pmbootstrap ==="
+          # Preconfigure pmbootstrap before init.
+          cat > "$PMB_CONFIG" <<EOF
+          [pmbootstrap]
+          aports = $PMB_APORTS
+          work = $PMB_WORK
+          device = $DEVICE
+          ui = none
+          user = user
+          hostname = nexus5
+          timezone = UTC
+          build_default_device_arch = armv7
+          is_default_channel = False
+          EOF
 
-          pmbootstrap \
-            --config "$PMB_CONFIG" \
-            --details-to-stdout \
-            init \
-            --aports "$PMB_APORTS" \
-            --device "$DEVICE" \
-            --ui none
+          echo "=== Configuration ==="
+          cat "$PMB_CONFIG"
 
-          echo "=== Check status ==="
+          echo "=== pmbootstrap init ==="
+
+          # Feed default answers if init requests input.
+          # pipefail is temporarily disabled because printf may
+          # receive SIGPIPE after pmbootstrap exits successfully.
+          set +o pipefail
+
+          printf '\n%.0s' {1..100} | \
+            timeout 180 \
+            pmbootstrap \
+              --config "$PMB_CONFIG" \
+              --aports "$PMB_APORTS" \
+              --work "$PMB_WORK" \
+              --details-to-stdout \
+              init
+
+          result=${PIPESTATUS[1]}
+
+          set -o pipefail
+
+          if [ "$result" -ne 0 ]; then
+            echo "::error::pmbootstrap init failed with exit code $result"
+            exit "$result"
+          fi
+
+          echo "=== Work directory ==="
+
+          ls -la "$PMB_WORK"
+
+          echo "=== Final configuration ==="
+
+          cat "$PMB_CONFIG"
+
+      # --------------------------------------------------
+      # 6. Verify configuration
+      # --------------------------------------------------
+      - name: Verify pmbootstrap configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== pmbootstrap version ==="
+          pmbootstrap --version
+
+          echo "=== pmbootstrap status ==="
 
           pmbootstrap \
             --config "$PMB_CONFIG" \
             --details-to-stdout \
             status
 
+          echo "=== Verify device ==="
+
+          grep -E \
+            '^(device|ui|aports|work) *=' \
+            "$PMB_CONFIG"
+
+          if ! grep -Eq '^device *= *lg-hammerhead *$' "$PMB_CONFIG"; then
+            echo "::error::Unexpected device configuration"
+            exit 1
+          fi
+
+      # --------------------------------------------------
+      # 7. Build Recovery ZIP
+      # --------------------------------------------------
       - name: Build TWRP Recovery ZIP
         shell: bash
         run: |
@@ -131,19 +215,21 @@ jobs:
           pmbootstrap \
             --config "$PMB_CONFIG" \
             --details-to-stdout \
-            -y \
+            --timeout 3600 \
+            --assume-yes \
             install \
             --android-recovery-zip \
             --password postmarketos
 
+      # --------------------------------------------------
+      # 8. Export build
+      # --------------------------------------------------
       - name: Export ROM
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p "$EXPORT_DIR"
-
-          echo "=== Exporting images ==="
 
           pmbootstrap \
             --config "$PMB_CONFIG" \
@@ -157,31 +243,49 @@ jobs:
             -type f \
             -printf '%p (%s bytes)\n'
 
-          echo "=== Recovery ZIP files ==="
+          echo "=== Find Recovery ZIP ==="
 
-          find "$EXPORT_DIR" \
+          ZIP_FILE=$(find "$EXPORT_DIR" \
             -type f \
             -iname '*.zip' \
-            -print
+            -print \
+            -quit)
 
-          if ! find "$EXPORT_DIR" \
-            -type f \
-            -iname '*.zip' \
-            -print -quit | grep -q .; then
-
-            echo "::error::No recovery ZIP found in export directory"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::Recovery ZIP not found"
             exit 1
           fi
 
+          echo "Recovery ZIP: $ZIP_FILE"
+
+          echo "=== Verify ZIP ==="
+
+          unzip -t "$ZIP_FILE"
+
+          echo "=== ZIP contents ==="
+
+          unzip -l "$ZIP_FILE" | head -80 || true
+
+          echo "=== SHA256 ==="
+
+          sha256sum "$ZIP_FILE" \
+            | tee "$EXPORT_DIR/SHA256SUMS.txt"
+
+      # --------------------------------------------------
+      # 9. Upload ROM
+      # --------------------------------------------------
       - name: Upload ROM
         uses: actions/upload-artifact@v4
         with:
-          name: postmarketos-nexus5-twrp
+          name: postmarketos-lg-hammerhead-twrp
           path: ${{ env.EXPORT_DIR }}/
           retention-days: 14
           if-no-files-found: error
 
-      - name: Upload debug logs on failure
+      # --------------------------------------------------
+      # 10. Upload debug logs on failure
+      # --------------------------------------------------
+      - name: Upload debug logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
