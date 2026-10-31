@@ -65,7 +65,7 @@ jobs:
 
       # --------------------------------------------------
       # 3. Clone pmaports
-      # --------------------------------------------------
+      # --------------------------------------------------      
       - name: Clone pmaports
         shell: bash
         run: |
@@ -73,12 +73,18 @@ jobs:
 
           git clone \
             --depth=1 \
-            --branch master \
             https://gitlab.postmarketos.org/postmarketOS/pmaports.git \
             "$PMB_APORTS"
 
-          echo "pmaports revision:"
+          echo "=== pmaports branch ==="
+          git -C "$PMB_APORTS" branch --show-current
+
+          echo "=== pmaports revision ==="
           git -C "$PMB_APORTS" rev-parse HEAD
+
+          echo "=== Nexus 5 device ==="
+          test -f \
+            "$PMB_APORTS/device/testing/device-lg-hammerhead/APKBUILD"
 
       # --------------------------------------------------
       # 4. Check Nexus 5 device package
