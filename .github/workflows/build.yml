@@ -3,18 +3,33 @@ name: Build Nexus 5 postmarketOS
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 330
+
+    env:
+      DEVICE: lg-hammerhead
+      PMB_WORK: /home/runner/.local/var/pmbootstrap
+      EXPORT_DIR: /home/runner/postmarketos-export
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git python3 openssl ca-certificates \
-            qemu-user-static binfmt-support
+            git \
+            python3 \
+            openssl \
+            ca-certificates \
+            qemu-user-static \
+            binfmt-support \
+            xz-utils \
+            zip \
+            unzip
 
       - name: Install pmbootstrap
         run: |
@@ -23,14 +38,126 @@ jobs:
             "$HOME/pmbootstrap"
 
           mkdir -p "$HOME/.local/bin"
-          ln -s "$HOME/pmbootstrap/pmbootstrap.py" \
+
+          ln -s \
+            "$HOME/pmbootstrap/pmbootstrap.py" \
             "$HOME/.local/bin/pmbootstrap"
 
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Check build environment
+      - name: Clone pmaports
         run: |
+          git clone --depth=1 \
+            https://gitlab.postmarketos.org/postmarketOS/pmaports.git \
+            "$HOME/pmaports"
+
+      - name: Check Nexus 5 device support
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking device: $DEVICE"
+
+          find "$HOME/pmaports/device" \
+            -type d \
+            -name "device-$DEVICE" \
+            -print
+
+          DEVICE_DIR=$(find "$HOME/pmaports/device" \
+            -type d \
+            -name "device-$DEVICE" \
+            -print -quit)
+
+          if [ -z "$DEVICE_DIR" ]; then
+            echo "::error::Device package not found: $DEVICE"
+            exit 1
+          fi
+
+          echo "Device package: $DEVICE_DIR"
+
+          echo "=== APKBUILD ==="
+          cat "$DEVICE_DIR/APKBUILD"
+
+          echo "=== Device information ==="
+          find "$DEVICE_DIR" \
+            -name 'deviceinfo*' \
+            -type f \
+            -exec sh -c 'echo "=== $1 ==="; cat "$1"' _ {} \;
+
+      - name: Configure pmbootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+
           pmbootstrap --version
-          pmbootstrap init --help
-          pmbootstrap install --help
-          pmbootstrap export --help
+
+          pmbootstrap config aports "$HOME/pmaports"
+          pmbootstrap config work "$PMB_WORK"
+          pmbootstrap config device "$DEVICE"
+          pmbootstrap config ui none
+          pmbootstrap config user user
+          pmbootstrap config hostname nexus5
+          pmbootstrap config timezone UTC
+
+          pmbootstrap status
+
+      - name: Build TWRP Recovery ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pmbootstrap \
+            --details-to-stdout \
+            -y \
+            install \
+            --android-recovery-zip \
+            --password postmarketos
+
+      - name: Export ROM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$EXPORT_DIR"
+
+          pmbootstrap export "$EXPORT_DIR"
+
+          echo "=== Exported files ==="
+
+          find "$EXPORT_DIR" \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p (%s bytes)\n'
+
+          echo "=== ZIP files ==="
+
+          find "$EXPORT_DIR" \
+            -type f \
+            -iname '*.zip' \
+            -print
+
+          if ! find "$EXPORT_DIR" \
+            -type f \
+            -iname '*.zip' \
+            -print -quit | grep -q .; then
+            echo "::error::No Recovery ZIP was exported"
+            exit 1
+          fi
+
+      - name: Upload ROM
+        uses: actions/upload-artifact@v4
+        with:
+          name: postmarketos-nexus5-twrp
+          path: ${{ env.EXPORT_DIR }}/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmbootstrap-debug-logs
+          path: |
+            /home/runner/.local/var/pmbootstrap/log.txt
+            /home/runner/.local/var/pmbootstrap/logs/
+          if-no-files-found: ignore
