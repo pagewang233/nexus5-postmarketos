@@ -168,6 +168,7 @@ jobs:
             --assume-yes \
             install \
             --android-recovery-zip \
+            --recovery-install-partition=data \
             --password postmarketos
 
       - name: Export ROM
@@ -226,6 +227,22 @@ jobs:
           echo "=== ZIP contents ==="
 
           unzip -l "$ZIP_FILE" | head -80 || true
+
+          echo "=== Verify recovery install target ==="
+
+          INSTALL_OPTIONS="$(unzip -p "$ZIP_FILE" chroot/install_options)"
+
+          printf '%s\n' "$INSTALL_OPTIONS" |
+            grep -E "^(DEVICE|SYSTEM_PARTLABEL|INSTALL_PARTITION)="
+
+          if ! printf '%s\n' "$INSTALL_OPTIONS" |
+            grep -qx "INSTALL_PARTITION='data'"
+          then
+            echo "::error::Recovery ZIP is not configured to install to data"
+            exit 1
+          fi
+
+          echo "Recovery ZIP install target verified: data"
 
           echo "=== SHA256 ==="
 
