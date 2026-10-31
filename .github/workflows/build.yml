@@ -1,281 +1,77 @@
-name: Build Nexus 5 postmarketOS
+name: Build postmarketOS Nexus 5 Headless
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   build:
-    name: Build postmarketOS for Nexus 5
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
-
-    env:
-      DEVICE: lg-hammerhead
-      PMB_WORK: /home/runner/.local/var/pmbootstrap
-      PMB_APORTS: /home/runner/pmaports
-      PMB_CONFIG: /home/runner/.config/pmbootstrap_v3.cfg
-      EXPORT_DIR: /home/runner/postmarketos-export
-      ARTIFACT_DIR: /home/runner/postmarketos-artifacts
+    timeout-minutes: 120
 
     steps:
       - name: Install dependencies
-        shell: bash
         run: |
-          set -euo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y \
             git \
             python3 \
-            openssl \
-            ca-certificates \
+            python3-pip \
+            pipx \
             qemu-user-static \
             binfmt-support \
+            parted \
+            e2fsprogs \
+            kpartx \
             xz-utils \
+            zstd \
             zip \
-            unzip \
-            file \
-            rsync
+            unzip
 
       - name: Install pmbootstrap
-        shell: bash
         run: |
-          set -euo pipefail
-
-          git clone --depth=1 \
-            https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git \
-            "$HOME/pmbootstrap"
-
-          mkdir -p "$HOME/.local/bin"
-
-          ln -s \
-            "$HOME/pmbootstrap/pmbootstrap.py" \
-            "$HOME/.local/bin/pmbootstrap"
-
+          pipx install pmbootstrap
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-          "$HOME/.local/bin/pmbootstrap" --version
-
       - name: Clone pmaports
-        shell: bash
         run: |
-          set -euo pipefail
-
           git clone --depth=1 \
             https://gitlab.postmarketos.org/postmarketOS/pmaports.git \
-            "$PMB_APORTS"
-
-          echo "=== pmaports branch ==="
-          git -C "$PMB_APORTS" branch --show-current
-
-          echo "=== pmaports revision ==="
-          git -C "$PMB_APORTS" rev-parse HEAD
-
-      - name: Check Nexus 5 device support
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          DEVICE_DIR="$PMB_APORTS/device/testing/device-$DEVICE"
-
-          test -f "$DEVICE_DIR/APKBUILD"
-          test -f "$DEVICE_DIR/deviceinfo"
-
-          echo "=== Device package ==="
-          grep -E \
-            '^(pkgname|pkgver|arch|depends)=' \
-            "$DEVICE_DIR/APKBUILD"
-
-          echo "=== Device information ==="
-          cat "$DEVICE_DIR/deviceinfo"
+            "$HOME/pmaports"
 
       - name: Initialize pmbootstrap
-        shell: bash
         run: |
-          set -euo pipefail
+          pmbootstrap init \
+            --non-interactive \
+            --aports="$HOME/pmaports" \
+            --device=lg-hammerhead \
+            --ui=none
 
-          mkdir -p "$(dirname "$PMB_CONFIG")"
-
-          if [ -e "$PMB_WORK" ]; then
-            sudo rm -rf "$PMB_WORK"
-          fi
-
-          cat > "$PMB_CONFIG" <<EOF
-          [pmbootstrap]
-          aports = $PMB_APORTS
-          work = $PMB_WORK
-          device = $DEVICE
-          ui = phosh
-          user = user
-          hostname = nexus5
-          timezone = UTC
-          build_default_device_arch = armv7
-          is_default_channel = False
-          EOF
-
-          echo "=== Initialize pmbootstrap ==="
-
-          set +o pipefail
-
-          printf '\n%.0s' {1..100} | \
-            timeout 180 \
-            pmbootstrap \
-              --config "$PMB_CONFIG" \
-              --aports "$PMB_APORTS" \
-              --work "$PMB_WORK" \
-              --details-to-stdout \
-              init
-
-          result=${PIPESTATUS[1]}
-
-          set -o pipefail
-
-          if [ "$result" -ne 0 ]; then
-            echo "::error::pmbootstrap init failed: $result"
-            exit "$result"
-          fi
-
-          echo "=== Final configuration ==="
-          cat "$PMB_CONFIG"
-
-      - name: Verify configuration
-        shell: bash
+      - name: Configure build
         run: |
-          set -euo pipefail
+          pmbootstrap config device lg-hammerhead
+          pmbootstrap config ui none
 
-          pmbootstrap \
-            --config "$PMB_CONFIG" \
-            --details-to-stdout \
-            status
-
-          grep -Eq \
-            '^device *= *lg-hammerhead *$' \
-            "$PMB_CONFIG"
-
-      - name: Build TWRP Recovery ZIP
-        shell: bash
+      - name: Install headless system
         run: |
-          set -euo pipefail
+          pmbootstrap install \
+            --android-recovery-zip
 
-          pmbootstrap \
-            --config "$PMB_CONFIG" \
-            --details-to-stdout \
-            --timeout 3600 \
-            --assume-yes \
-            install \
-            --android-recovery-zip \
-            --recovery-install-partition=data \
-            --password postmarketos
-
-      - name: Export ROM
-        shell: bash
+      - name: Export Recovery ZIP
         run: |
-          set -euo pipefail
+          mkdir -p output
+          pmbootstrap export
 
-          mkdir -p "$EXPORT_DIR"
-          mkdir -p "$ARTIFACT_DIR"
+          find /tmp/postmarketOS-export \
+            -maxdepth 2 \
+            -type f \
+            -name '*.zip' \
+            -exec cp {} output/pmos-lg-hammerhead-headless.zip \;
 
-          echo "=== Export images ==="
-
-          pmbootstrap \
-            --config "$PMB_CONFIG" \
-            --details-to-stdout \
-            export "$EXPORT_DIR"
-
-          echo "=== Export directory ==="
-
-          ls -lah "$EXPORT_DIR"
-
-          echo "=== Copy exported files ==="
-
-          # pmbootstrap export creates symlinks.
-          # Dereference them so GitHub Actions uploads real files.
-          for name in \
-            pmos-lg-hammerhead.zip \
-            boot.img \
-            lk2nd.img \
-            initramfs \
-            vmlinuz
-          do
-            source="$EXPORT_DIR/$name"
-
-            if [ -f "$source" ]; then
-              cp -L "$source" "$ARTIFACT_DIR/$name"
-              echo "Copied: $name"
-            else
-              echo "Not available: $name"
-            fi
-          done
-
-          echo "=== Verify Recovery ZIP ==="
-
-          ZIP_FILE="$ARTIFACT_DIR/pmos-lg-hammerhead.zip"
-
-          if [ ! -s "$ZIP_FILE" ]; then
-            echo "::error::Recovery ZIP missing or empty"
-            exit 1
-          fi
-
-          file "$ZIP_FILE"
-
-          unzip -t "$ZIP_FILE"
-
-          echo "=== ZIP contents ==="
-
-          unzip -l "$ZIP_FILE" | head -80 || true
-
-          echo "=== Verify recovery install target ==="
-
-          INSTALL_OPTIONS="$(unzip -p "$ZIP_FILE" chroot/install_options)"
-
-          printf '%s\n' "$INSTALL_OPTIONS" |
-            grep -E "^(DEVICE|SYSTEM_PARTLABEL|INSTALL_PARTITION)="
-
-          if ! printf '%s\n' "$INSTALL_OPTIONS" |
-            grep -qx "INSTALL_PARTITION='data'"
-          then
-            echo "::error::Recovery ZIP is not configured to install to data"
-            exit 1
-          fi
-
-          echo "Recovery ZIP install target verified: data"
-
-          echo "=== SHA256 ==="
-
-          (
-            cd "$ARTIFACT_DIR"
-            sha256sum \
-              pmos-lg-hammerhead.zip \
-              > SHA256SUMS.txt
-          )
-
-          cat "$ARTIFACT_DIR/SHA256SUMS.txt"
-
-          echo "=== Final artifacts ==="
-
-          ls -lah "$ARTIFACT_DIR"
+          ls -lh output/
 
       - name: Upload ROM
         uses: actions/upload-artifact@v4
         with:
-          name: postmarketos-lg-hammerhead-twrp
-          path: ${{ env.ARTIFACT_DIR }}/
-          retention-days: 14
+          name: postmarketos-lg-hammerhead-headless
+          path: output/*.zip
           if-no-files-found: error
-          compression-level: 0
-
-      - name: Upload debug logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pmbootstrap-debug-logs
-          path: |
-            /home/runner/.local/var/pmbootstrap/log.txt
-            /home/runner/.local/var/pmbootstrap/logs/
-            /home/runner/.config/pmbootstrap_v3.cfg
-          retention-days: 7
-          if-no-files-found: ignore
