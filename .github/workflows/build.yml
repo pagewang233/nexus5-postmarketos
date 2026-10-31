@@ -109,7 +109,7 @@ jobs:
           aports = $PMB_APORTS
           work = $PMB_WORK
           device = $DEVICE
-          ui = none
+          ui = phosh
           user = user
           hostname = nexus5
           timezone = UTC
