@@ -1,0 +1,36 @@
+name: Build Nexus 5 postmarketOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git python3 openssl ca-certificates \
+            qemu-user-static binfmt-support
+
+      - name: Install pmbootstrap
+        run: |
+          git clone --depth=1 \
+            https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git \
+            "$HOME/pmbootstrap"
+
+          mkdir -p "$HOME/.local/bin"
+          ln -s "$HOME/pmbootstrap/pmbootstrap.py" \
+            "$HOME/.local/bin/pmbootstrap"
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check build environment
+        run: |
+          pmbootstrap --version
+          pmbootstrap init --help
+          pmbootstrap install --help
+          pmbootstrap export --help
