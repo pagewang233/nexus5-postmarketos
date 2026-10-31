@@ -8,18 +8,28 @@ permissions:
 
 jobs:
   build:
+    name: Build postmarketOS for Nexus 5
     runs-on: ubuntu-24.04
     timeout-minutes: 330
 
     env:
       DEVICE: lg-hammerhead
       PMB_WORK: /home/runner/.local/var/pmbootstrap
+      PMB_APORTS: /home/runner/pmaports
+      PMB_CONFIG: /home/runner/.config/pmbootstrap_v3.cfg
       EXPORT_DIR: /home/runner/postmarketos-export
 
     steps:
+      # --------------------------------------------------
+      # 1. Install dependencies
+      # --------------------------------------------------
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             git \
             python3 \
@@ -29,10 +39,18 @@ jobs:
             binfmt-support \
             xz-utils \
             zip \
-            unzip
+            unzip \
+            file \
+            rsync
 
+      # --------------------------------------------------
+      # 2. Install pmbootstrap
+      # --------------------------------------------------
       - name: Install pmbootstrap
+        shell: bash
         run: |
+          set -euo pipefail
+
           git clone --depth=1 \
             https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git \
             "$HOME/pmbootstrap"
@@ -45,74 +63,104 @@ jobs:
 
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # --------------------------------------------------
+      # 3. Clone pmaports
+      # --------------------------------------------------
       - name: Clone pmaports
+        shell: bash
         run: |
-          git clone --depth=1 \
-            https://gitlab.postmarketos.org/postmarketOS/pmaports.git \
-            "$HOME/pmaports"
+          set -euo pipefail
 
+          git clone \
+            --depth=1 \
+            --branch master \
+            https://gitlab.postmarketos.org/postmarketOS/pmaports.git \
+            "$PMB_APORTS"
+
+          echo "pmaports revision:"
+          git -C "$PMB_APORTS" rev-parse HEAD
+
+      # --------------------------------------------------
+      # 4. Check Nexus 5 device package
+      # --------------------------------------------------
       - name: Check Nexus 5 device support
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking device: $DEVICE"
+          DEVICE_DIR="$PMB_APORTS/device/testing/device-$DEVICE"
 
-          find "$HOME/pmaports/device" \
-            -type d \
-            -name "device-$DEVICE" \
-            -print
-
-          DEVICE_DIR=$(find "$HOME/pmaports/device" \
-            -type d \
-            -name "device-$DEVICE" \
-            -print -quit)
-
-          if [ -z "$DEVICE_DIR" ]; then
-            echo "::error::Device package not found: $DEVICE"
+          if [ ! -f "$DEVICE_DIR/APKBUILD" ]; then
+            echo "::error::Device package not found: $DEVICE_DIR"
             exit 1
           fi
 
-          echo "Device package: $DEVICE_DIR"
+          if [ ! -f "$DEVICE_DIR/deviceinfo" ]; then
+            echo "::error::Deviceinfo not found"
+            exit 1
+          fi
 
-          echo "=== APKBUILD ==="
-          cat "$DEVICE_DIR/APKBUILD"
+          echo "=== Device package ==="
+          grep -E \
+            '^(pkgname|pkgver|arch|depends)=' \
+            "$DEVICE_DIR/APKBUILD"
 
           echo "=== Device information ==="
-          find "$DEVICE_DIR" \
-            -name 'deviceinfo*' \
-            -type f \
-            -exec sh -c 'echo "=== $1 ==="; cat "$1"' _ {} \;
+          cat "$DEVICE_DIR/deviceinfo"
 
+      # --------------------------------------------------
+      # 5. Generate pmbootstrap configuration
+      # --------------------------------------------------
       - name: Configure pmbootstrap
         shell: bash
         run: |
           set -euo pipefail
 
+          mkdir -p "$(dirname "$PMB_CONFIG")"
+          mkdir -p "$PMB_WORK"
+
+          cat > "$PMB_CONFIG" <<EOF
+          [pmbootstrap]
+          aports = $PMB_APORTS
+          work = $PMB_WORK
+          device = $DEVICE
+          ui = none
+          user = user
+          hostname = nexus5
+          timezone = UTC
+          EOF
+
+          echo "=== Configuration ==="
+          cat "$PMB_CONFIG"
+
+          echo "=== pmbootstrap version ==="
           pmbootstrap --version
 
-          pmbootstrap config aports "$HOME/pmaports"
-          pmbootstrap config work "$PMB_WORK"
-          pmbootstrap config device "$DEVICE"
-          pmbootstrap config ui none
-          pmbootstrap config user user
-          pmbootstrap config hostname nexus5
-          pmbootstrap config timezone UTC
+          echo "=== pmbootstrap status ==="
+          pmbootstrap \
+            --config "$PMB_CONFIG" \
+            status
 
-          pmbootstrap status
-
+      # --------------------------------------------------
+      # 6. Build postmarketOS Recovery ZIP
+      # --------------------------------------------------
       - name: Build TWRP Recovery ZIP
         shell: bash
         run: |
           set -euo pipefail
 
           pmbootstrap \
+            --config "$PMB_CONFIG" \
             --details-to-stdout \
-            -y \
+            --timeout 3600 \
+            --assume-yes \
             install \
             --android-recovery-zip \
             --password postmarketos
 
+      # --------------------------------------------------
+      # 7. Export generated ROM
+      # --------------------------------------------------
       - name: Export ROM
         shell: bash
         run: |
@@ -120,39 +168,56 @@ jobs:
 
           mkdir -p "$EXPORT_DIR"
 
-          pmbootstrap export "$EXPORT_DIR"
+          pmbootstrap \
+            --config "$PMB_CONFIG" \
+            --details-to-stdout \
+            export "$EXPORT_DIR"
 
           echo "=== Exported files ==="
 
           find "$EXPORT_DIR" \
-            -maxdepth 2 \
+            -maxdepth 3 \
             -type f \
             -printf '%p (%s bytes)\n'
 
-          echo "=== ZIP files ==="
+          echo "=== Checking Recovery ZIP ==="
 
-          find "$EXPORT_DIR" \
+          ZIP_FILE=$(find "$EXPORT_DIR" \
             -type f \
             -iname '*.zip' \
-            -print
+            -print -quit)
 
-          if ! find "$EXPORT_DIR" \
-            -type f \
-            -iname '*.zip' \
-            -print -quit | grep -q .; then
-            echo "::error::No Recovery ZIP was exported"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::Recovery ZIP not found"
             exit 1
           fi
 
+          echo "Recovery ZIP: $ZIP_FILE"
+
+          unzip -t "$ZIP_FILE"
+
+          echo "=== ZIP contents ==="
+          unzip -l "$ZIP_FILE" | head -80 || true
+
+          echo "=== SHA256 ==="
+          sha256sum "$ZIP_FILE" | tee \
+            "$EXPORT_DIR/SHA256SUMS.txt"
+
+      # --------------------------------------------------
+      # 8. Upload ROM
+      # --------------------------------------------------
       - name: Upload ROM
         uses: actions/upload-artifact@v4
         with:
-          name: postmarketos-nexus5-twrp
+          name: postmarketos-lg-hammerhead-twrp
           path: ${{ env.EXPORT_DIR }}/
           retention-days: 14
           if-no-files-found: error
 
-      - name: Upload build logs on failure
+      # --------------------------------------------------
+      # 9. Upload logs on failure
+      # --------------------------------------------------
+      - name: Upload debug logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -160,4 +225,5 @@ jobs:
           path: |
             /home/runner/.local/var/pmbootstrap/log.txt
             /home/runner/.local/var/pmbootstrap/logs/
+            /home/runner/.config/pmbootstrap_v3.cfg
           if-no-files-found: ignore
