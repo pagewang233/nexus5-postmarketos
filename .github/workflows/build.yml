@@ -26,6 +26,7 @@ jobs:
           set -euo pipefail
 
           sudo apt-get update
+
           sudo apt-get install -y \
             git \
             python3 \
@@ -73,7 +74,7 @@ jobs:
           echo "=== pmaports revision ==="
           git -C "$PMB_APORTS" rev-parse HEAD
 
-      - name: Validate Nexus 5 device
+      - name: Check Nexus 5 device support
         shell: bash
         run: |
           set -euo pipefail
@@ -84,11 +85,13 @@ jobs:
           test -f "$DEVICE_DIR/deviceinfo"
 
           echo "=== Device package ==="
+
           grep -E \
             '^(pkgname|pkgver|arch|depends)=' \
             "$DEVICE_DIR/APKBUILD"
 
           echo "=== Device information ==="
+
           cat "$DEVICE_DIR/deviceinfo"
 
       - name: Configure pmbootstrap
@@ -97,7 +100,20 @@ jobs:
           set -euo pipefail
 
           mkdir -p "$(dirname "$PMB_CONFIG")"
-          mkdir -p "$PMB_WORK"
+
+          # IMPORTANT:
+          # Do NOT create PMB_WORK manually.
+          # pmbootstrap must initialize its work directory itself.
+          #
+          # An existing empty directory without version metadata
+          # can trigger:
+          # "Your work folder version needs to be migrated
+          #  (from version  to 8)"
+
+          if [ -e "$PMB_WORK" ]; then
+            echo "Removing existing work directory..."
+            sudo rm -rf "$PMB_WORK"
+          fi
 
           cat > "$PMB_CONFIG" <<EOF
           [pmbootstrap]
@@ -118,16 +134,28 @@ jobs:
           echo "=== pmbootstrap version ==="
           pmbootstrap --version
 
+          echo "=== Verify work directory ==="
+
+          if [ -e "$PMB_WORK" ]; then
+            echo "::error::Work directory must not exist before initialization"
+            exit 1
+          fi
+
+          echo "Work directory does not exist (expected)."
+
           echo "=== pmbootstrap status ==="
+
           pmbootstrap \
             --config "$PMB_CONFIG" \
             --details-to-stdout \
             status
 
-      - name: Build TWRP recovery ZIP
+      - name: Build TWRP Recovery ZIP
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "=== Building postmarketOS ==="
 
           pmbootstrap \
             --config "$PMB_CONFIG" \
@@ -137,12 +165,14 @@ jobs:
             --android-recovery-zip \
             --password postmarketos
 
-      - name: Export images
+      - name: Export ROM
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p "$EXPORT_DIR"
+
+          echo "=== Exporting images ==="
 
           pmbootstrap \
             --config "$PMB_CONFIG" \
@@ -168,20 +198,19 @@ jobs:
             -iname '*.zip' \
             -print -quit | grep -q .; then
 
-            echo "::error::No recovery ZIP was exported"
+            echo "::error::No recovery ZIP found in export directory"
             exit 1
           fi
 
       - name: Upload ROM
         uses: actions/upload-artifact@v4
         with:
-          name: nexus5-postmarketos-twrp
-          path: /home/runner/postmarketos-export/
+          name: postmarketos-nexus5-twrp
+          path: ${{ env.EXPORT_DIR }}/
+          retention-days: 14
           if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
 
-      - name: Upload debug logs
+      - name: Upload debug logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -190,5 +219,5 @@ jobs:
             /home/runner/.local/var/pmbootstrap/log.txt
             /home/runner/.local/var/pmbootstrap/logs/
             /home/runner/.config/pmbootstrap_v3.cfg
-          if-no-files-found: ignore
           retention-days: 7
+          if-no-files-found: ignore
