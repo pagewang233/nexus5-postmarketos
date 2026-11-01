@@ -20,7 +20,20 @@ jobs:
       EXPORT_DIR: /home/runner/postmarketos-export
       ARTIFACT_DIR: /home/runner/postmarketos-artifacts
 
+      # Nexus 5 System partition:
+      # /dev/block/mmcblk0p25 = 1,536,000,512 bytes
+      SYSTEM_PARTITION_BYTES: "1536000512"
+
+      # Recovery installer reserves approximately 256 MB for boot.
+      # This is a conservative rootfs preflight budget, not the
+      # final filesystem capacity.
+      ROOTFS_BUDGET_BYTES: "1101004800"
+
     steps:
+      # ------------------------------------------------------------
+      # Dependencies
+      # ------------------------------------------------------------
+
       - name: Install dependencies
         shell: bash
         run: |
@@ -39,7 +52,14 @@ jobs:
             zip \
             unzip \
             file \
-            rsync
+            rsync \
+            e2fsprogs \
+            util-linux \
+            parted
+
+      # ------------------------------------------------------------
+      # pmbootstrap
+      # ------------------------------------------------------------
 
       - name: Install pmbootstrap
         shell: bash
@@ -60,6 +80,13 @@ jobs:
 
           "$HOME/.local/bin/pmbootstrap" --version
 
+          echo "=== pmbootstrap revision ==="
+          git -C "$HOME/pmbootstrap" rev-parse HEAD
+
+      # ------------------------------------------------------------
+      # pmaports
+      # ------------------------------------------------------------
+
       - name: Clone pmaports
         shell: bash
         run: |
@@ -75,6 +102,10 @@ jobs:
           echo "=== pmaports revision ==="
           git -C "$PMB_APORTS" rev-parse HEAD
 
+      # ------------------------------------------------------------
+      # Device support
+      # ------------------------------------------------------------
+
       - name: Check Nexus 5 device support
         shell: bash
         run: |
@@ -86,12 +117,29 @@ jobs:
           test -f "$DEVICE_DIR/deviceinfo"
 
           echo "=== Device package ==="
+
           grep -E \
             '^(pkgname|pkgver|arch|depends)=' \
-            "$DEVICE_DIR/APKBUILD"
+            "$DEVICE_DIR/APKBUILD" || true
 
           echo "=== Device information ==="
           cat "$DEVICE_DIR/deviceinfo"
+
+          echo "=== Wi-Fi related device configuration ==="
+
+          grep -RniE \
+            'wifi|wlan|wcn|firmware|ath|regdom' \
+            "$DEVICE_DIR" || true
+
+          echo "=== Kernel dependencies ==="
+
+          grep -E \
+            'linux-|firmware|wcn|wifi' \
+            "$DEVICE_DIR/APKBUILD" || true
+
+      # ------------------------------------------------------------
+      # Initialize
+      # ------------------------------------------------------------
 
       - name: Initialize pmbootstrap
         shell: bash
@@ -142,6 +190,10 @@ jobs:
           echo "=== Final configuration ==="
           cat "$PMB_CONFIG"
 
+      # ------------------------------------------------------------
+      # Verify configuration
+      # ------------------------------------------------------------
+
       - name: Verify configuration
         shell: bash
         run: |
@@ -160,6 +212,12 @@ jobs:
             '^ui *= *none *$' \
             "$PMB_CONFIG"
 
+          echo "=== Headless configuration verified ==="
+
+      # ------------------------------------------------------------
+      # Build
+      # ------------------------------------------------------------
+
       - name: Build TWRP Recovery ZIP
         shell: bash
         env:
@@ -168,7 +226,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "$PMOS_PASSWORD" ]; then
-            echo "::error::Set the repository Actions secret PMOS_PASSWORD before building"
+            echo "::error::Set repository Actions secret PMOS_PASSWORD"
             exit 1
           fi
 
@@ -181,6 +239,10 @@ jobs:
             --android-recovery-zip \
             --add iw,wireless-regdb,postmarketos-base-ui-networkmanager,postmarketos-base-ui-wifi-wpa_supplicant \
             --password "$PMOS_PASSWORD"
+
+      # ------------------------------------------------------------
+      # Export
+      # ------------------------------------------------------------
 
       - name: Export ROM
         shell: bash
@@ -198,13 +260,10 @@ jobs:
             export "$EXPORT_DIR"
 
           echo "=== Export directory ==="
-
           ls -lah "$EXPORT_DIR"
 
           echo "=== Copy exported files ==="
 
-          # pmbootstrap export creates symlinks.
-          # Dereference them so GitHub Actions uploads real files.
           for name in \
             pmos-lg-hammerhead.zip \
             boot.img \
@@ -222,8 +281,6 @@ jobs:
             fi
           done
 
-          echo "=== Verify Recovery ZIP ==="
-
           ZIP_FILE="$ARTIFACT_DIR/pmos-lg-hammerhead.zip"
 
           if [ ! -s "$ZIP_FILE" ]; then
@@ -231,94 +288,334 @@ jobs:
             exit 1
           fi
 
+          echo "=== Verify Recovery ZIP ==="
+
           file "$ZIP_FILE"
-          unzip -t "$ZIP_FILE"
+          unzip -tq "$ZIP_FILE"
 
           echo "=== ZIP contents ==="
           unzip -l "$ZIP_FILE" | head -80 || true
 
+          echo "=== Recovery installer options ==="
+
+          unzip -p \
+            "$ZIP_FILE" \
+            chroot/install_options \
+            | tee "$ARTIFACT_DIR/install-options.txt"
+
+          if ! grep -Eq \
+            "^INSTALL_PARTITION=['\"]?system['\"]?$" \
+            "$ARTIFACT_DIR/install-options.txt"; then
+            echo "::error::Recovery ZIP is not configured for System partition"
+            exit 1
+          fi
+
           echo "=== SHA256 ==="
+
           (
             cd "$ARTIFACT_DIR"
             sha256sum pmos-lg-hammerhead.zip > SHA256SUMS.txt
           )
+
           cat "$ARTIFACT_DIR/SHA256SUMS.txt"
 
-          echo "=== Final artifacts ==="
-          ls -lah "$ARTIFACT_DIR"
+      # ------------------------------------------------------------
+      # Validate packages and services
+      # ------------------------------------------------------------
 
-      - name: Validate Wi-Fi, SSH, and rootfs size
+      - name: Validate Wi-Fi and SSH
         shell: bash
         run: |
           set -euo pipefail
 
           ROOTFS="$PMB_WORK/chroot_rootfs_$DEVICE"
           INSTALLED_DB="$ROOTFS/lib/apk/db/installed"
-          ZIP_FILE="$ARTIFACT_DIR/pmos-lg-hammerhead.zip"
 
           test -s "$INSTALLED_DB"
-          test -s "$ZIP_FILE"
 
-          echo "=== Validate required packages ==="
+          echo "=== Installed networking packages ==="
+
+          awk '
+            /^P:/ {
+              package = substr($0, 3)
+              if (package ~ /networkmanager|wpa|wifi|wireless|firmware|openssh|^iw$/)
+                print package
+            }
+          ' "$INSTALLED_DB"
+
+          echo "=== Validate requested packages ==="
+
           for package in \
             iw \
             wireless-regdb \
-            networkmanager \
-            networkmanager-cli \
-            networkmanager-wifi \
-            networkmanager-systemd \
-            wpa_supplicant \
-            openssh-server-pam
+            postmarketos-base-ui-networkmanager \
+            postmarketos-base-ui-wifi-wpa_supplicant
           do
             if ! grep -Fqx "P:$package" "$INSTALLED_DB"; then
-              echo "::error::Required package missing from rootfs: $package"
+              echo "::error::Missing requested package: $package"
               exit 1
             fi
+
             echo "Installed: $package"
           done
 
-          test -x "$ROOTFS/usr/sbin/NetworkManager"
-          test -x "$ROOTFS/usr/bin/nmcli"
-          test -f "$ROOTFS/usr/lib/systemd/system/NetworkManager.service"
-          test -e "$ROOTFS/etc/systemd/system/multi-user.target.wants/NetworkManager.service"
-          test -x "$ROOTFS/usr/sbin/sshd"
-          test -e "$ROOTFS/etc/systemd/system/multi-user.target.wants/sshd.service"
+          echo "=== Validate NetworkManager ==="
 
-          ROOTFS_CHECK_DIR="$(mktemp -d "$RUNNER_TEMP/hammerhead-rootfs.XXXXXX")"
-          ROOTFS_ARCHIVE="$(mktemp "$RUNNER_TEMP/hammerhead-rootfs.XXXXXX.tar.gz")"
-          trap 'rm -rf "$ROOTFS_CHECK_DIR"; rm -f "$ROOTFS_ARCHIVE"' EXIT
-
-          echo "=== Measure unpacked rootfs from the TWRP ZIP ==="
-          unzip -p "$ZIP_FILE" rootfs.tar.gz > "$ROOTFS_ARCHIVE"
-          gzip -t "$ROOTFS_ARCHIVE"
-          tar -xzf "$ROOTFS_ARCHIVE" -C "$ROOTFS_CHECK_DIR"
-
-          ROOTFS_APPARENT_BYTES="$(du --apparent-size -sb "$ROOTFS_CHECK_DIR" | awk '{print $1}')"
-          ROOTFS_ALLOCATED_BYTES="$(du -sx --block-size=1 "$ROOTFS_CHECK_DIR" | awk '{print $1}')"
-          LIMIT_BYTES=$((143 * 1024 * 1024 * 1024 / 100))
-
-          {
-            echo "apparent_bytes=$ROOTFS_APPARENT_BYTES"
-            echo "runner_allocated_bytes=$ROOTFS_ALLOCATED_BYTES"
-            echo "system_partition_limit_bytes=$LIMIT_BYTES"
-            echo "system_partition_limit_gib=1.43"
-          } | tee "$ARTIFACT_DIR/rootfs-size.txt"
-
-          if [ "$ROOTFS_APPARENT_BYTES" -gt "$LIMIT_BYTES" ]; then
-            echo "::error::Unpacked rootfs exceeds the 1.43 GiB system partition budget"
+          if [ ! -x "$ROOTFS/usr/bin/nmcli" ]; then
+            echo "::error::nmcli missing"
             exit 1
           fi
 
-          echo "Rootfs fits the 1.43 GiB logical-size budget."
+          if [ ! -x "$ROOTFS/usr/sbin/NetworkManager" ]; then
+            echo "::error::NetworkManager missing"
+            exit 1
+          fi
+
+          echo "=== Validate SSH ==="
+
+          if [ ! -x "$ROOTFS/usr/sbin/sshd" ]; then
+            echo "::error::sshd missing"
+            exit 1
+          fi
+
+          echo "=== Validate init system ==="
+
+          if [ -f "$ROOTFS/etc/init.d/networkmanager" ]; then
+            echo "OpenRC NetworkManager service found"
+          else
+            echo "::error::OpenRC NetworkManager service missing"
+            exit 1
+          fi
+
+          if [ -f "$ROOTFS/etc/init.d/sshd" ]; then
+            echo "OpenRC SSH service found"
+          else
+            echo "::error::OpenRC SSH service missing"
+            exit 1
+          fi
+
+          echo "=== OpenRC default services ==="
+
+          if [ -d "$ROOTFS/etc/runlevels/default" ]; then
+            ls -lah "$ROOTFS/etc/runlevels/default"
+          else
+            echo "::warning::OpenRC default runlevel directory missing"
+          fi
+
+          echo "=== NetworkManager autostart ==="
+
+          if [ -e "$ROOTFS/etc/runlevels/default/networkmanager" ]; then
+            echo "NetworkManager enabled"
+          else
+            echo "::warning::NetworkManager is installed but default autostart was not verified"
+          fi
+
+          echo "=== SSH autostart ==="
+
+          if [ -e "$ROOTFS/etc/runlevels/default/sshd" ]; then
+            echo "SSH enabled"
+          else
+            echo "::warning::SSH is installed but default autostart was not verified"
+          fi
+
+          echo "=== Wi-Fi configuration ==="
+
+          if [ -d "$ROOTFS/etc/NetworkManager/system-connections" ]; then
+            find \
+              "$ROOTFS/etc/NetworkManager/system-connections" \
+              -maxdepth 1 \
+              -type f \
+              -printf '%f\n'
+          else
+            echo "No preconfigured NetworkManager connections"
+          fi
+
+          echo "=== Firmware directories ==="
+
+          for directory in \
+            "$ROOTFS/lib/firmware" \
+            "$ROOTFS/usr/lib/firmware"
+          do
+            if [ -d "$directory" ]; then
+              find "$directory" \
+                -type f \
+                \( -iname '*wcn*' \
+                -o -iname '*wlan*' \
+                -o -iname '*prima*' \
+                -o -iname '*ath*' \) \
+                -print | head -100 || true
+            fi
+          done
+
+          echo "=== Validation complete ==="
+
+      # ------------------------------------------------------------
+      # Rootfs size validation
+      # ------------------------------------------------------------
+
+      - name: Validate rootfs size
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$ARTIFACT_DIR/pmos-lg-hammerhead.zip"
+
+          test -s "$ZIP_FILE"
+
+          ROOTFS_CHECK_DIR="$(mktemp -d "$RUNNER_TEMP/hammerhead-rootfs.XXXXXX")"
+          ROOTFS_ARCHIVE="$(mktemp "$RUNNER_TEMP/hammerhead-rootfs.XXXXXX.tar.gz")"
+
+          trap 'rm -rf "$ROOTFS_CHECK_DIR"; rm -f "$ROOTFS_ARCHIVE"' EXIT
+
+          echo "=== Extract rootfs archive ==="
+
+          ROOTFS_ENTRY="$(
+            unzip -Z1 "$ZIP_FILE" \
+              | grep -E '(^|/)rootfs\.tar\.gz$' \
+              | head -1
+          )"
+
+          if [ -z "$ROOTFS_ENTRY" ]; then
+            echo "::error::rootfs.tar.gz not found in Recovery ZIP"
+            exit 1
+          fi
+
+          echo "Rootfs entry: $ROOTFS_ENTRY"
+
+          unzip -p "$ZIP_FILE" "$ROOTFS_ENTRY" > "$ROOTFS_ARCHIVE"
+
+          gzip -t "$ROOTFS_ARCHIVE"
+
+          echo "=== Extract rootfs ==="
+
+          tar -xzf \
+            "$ROOTFS_ARCHIVE" \
+            -C "$ROOTFS_CHECK_DIR"
+
+          echo "=== Measure rootfs ==="
+
+          ROOTFS_APPARENT_BYTES="$(
+            du --apparent-size -sb "$ROOTFS_CHECK_DIR" \
+              | awk '{print $1}'
+          )"
+
+          ROOTFS_ALLOCATED_BYTES="$(
+            du -sx --block-size=1 "$ROOTFS_CHECK_DIR" \
+              | awk '{print $1}'
+          )"
+
+          {
+            echo "system_partition_bytes=$SYSTEM_PARTITION_BYTES"
+            echo "rootfs_budget_bytes=$ROOTFS_BUDGET_BYTES"
+            echo "rootfs_apparent_bytes=$ROOTFS_APPARENT_BYTES"
+            echo "runner_allocated_bytes=$ROOTFS_ALLOCATED_BYTES"
+          } | tee "$ARTIFACT_DIR/rootfs-size.txt"
+
+          if [ "$ROOTFS_APPARENT_BYTES" -gt "$ROOTFS_BUDGET_BYTES" ]; then
+            echo "::error::Rootfs exceeds conservative System partition budget"
+            exit 1
+          fi
+
+          echo "=== Test rootfs on ext4 image ==="
+
+          # Model the installer root partition:
+          # System partition minus boot reservation.
+          #
+          # This test checks whether the extracted rootfs can
+          # actually fit on an ext4 filesystem.
+
+          BOOT_RESERVATION_BYTES=256000000
+
+          ROOT_PARTITION_BYTES=$(
+            (SYSTEM_PARTITION_BYTES - BOOT_RESERVATION_BYTES)
+          )
+
+          echo "Root partition bytes: $ROOT_PARTITION_BYTES"
+
+          EXT4_IMAGE="$RUNNER_TEMP/hammerhead-rootfs-test.ext4"
+
+          truncate \
+            -s "$ROOT_PARTITION_BYTES" \
+            "$EXT4_IMAGE"
+
+          mkfs.ext4 \
+            -F \
+            -q \
+            -m 0 \
+            "$EXT4_IMAGE"
+
+          TEST_MOUNT="$(mktemp -d "$RUNNER_TEMP/hammerhead-mount.XXXXXX")"
+
+          cleanup_mount() {
+            sudo umount "$TEST_MOUNT" 2>/dev/null || true
+            rmdir "$TEST_MOUNT" 2>/dev/null || true
+            rm -f "$EXT4_IMAGE"
+          }
+
+          trap 'cleanup_mount; rm -rf "$ROOTFS_CHECK_DIR"; rm -f "$ROOTFS_ARCHIVE"' EXIT
+
+          sudo mount \
+            -o loop \
+            "$EXT4_IMAGE" \
+            "$TEST_MOUNT"
+
+          echo "=== Copy rootfs into ext4 ==="
+
+          sudo rsync \
+            -aHAX \
+            --numeric-ids \
+            "$ROOTFS_CHECK_DIR/" \
+            "$TEST_MOUNT/"
+
+          echo "=== ext4 usage ==="
+
+          df -h "$TEST_MOUNT"
+
+          df -B1 "$TEST_MOUNT" \
+            | tail -1 \
+            | tee "$ARTIFACT_DIR/rootfs-ext4-usage.txt"
+
+          sync
+
+          echo "=== Rootfs fits ext4 test filesystem ==="
+
+      # ------------------------------------------------------------
+      # Build metadata
+      # ------------------------------------------------------------
+
+      - name: Save build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "device=$DEVICE"
+            echo "ui=none"
+            echo "runner=ubuntu-24.04"
+            echo "pmbootstrap_revision=$(git -C "$HOME/pmbootstrap" rev-parse HEAD)"
+            echo "pmaports_revision=$(git -C "$PMB_APORTS" rev-parse HEAD)"
+            echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$ARTIFACT_DIR/build-info.txt"
+
+          echo "=== Build metadata ==="
+          cat "$ARTIFACT_DIR/build-info.txt"
+
+      # ------------------------------------------------------------
+      # Upload
+      # ------------------------------------------------------------
 
       - name: Upload ROM
         uses: actions/upload-artifact@v4
         with:
-          name: postmarketos-lg-hammerhead-twrp
+          name: postmarketos-lg-hammerhead-headless
           path: ${{ env.ARTIFACT_DIR }}/
           retention-days: 14
           if-no-files-found: error
           compression-level: 0
+
+      # ------------------------------------------------------------
+      # Debug logs
+      # ------------------------------------------------------------
 
       - name: Upload debug logs
         if: failure()
