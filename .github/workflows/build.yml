@@ -237,14 +237,9 @@ jobs:
       - name: Build TWRP Recovery ZIP
         shell: bash
         env:
-          PMOS_PASSWORD: ${{ secrets.PMOS_PASSWORD }}
+          PMOS_PASSWORD: "nexus5"
         run: |
           set -euo pipefail
-
-          if [ -z "$PMOS_PASSWORD" ]; then
-            echo "::error::Missing Actions secret PMOS_PASSWORD"
-            exit 1
-          fi
 
           echo "=== Build Nexus 5 headless ROM ==="
 
